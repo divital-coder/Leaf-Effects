@@ -36,20 +36,21 @@ def get_transforms(train: bool = True) -> T_v2.Compose:
             T_v2.RandomHorizontalFlip(p=0.5),
             T_v2.RandomVerticalFlip(p=0.5),
             T_v2.RandomRotation(degrees=15),
-            # Be careful with color jitter on fluorescence - keep it minimal
-            T_v2.ColorJitter(
-                brightness=AUGMENTATION_STRENGTH * 0.1,
-                contrast=AUGMENTATION_STRENGTH * 0.1
-            ),
-            T_v2.RandomApply([
-                T_v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
-            ], p=0.2)
+            # Remove ColorJitter and GaussianBlur - they don't work with 6 channels
+            # T_v2.ColorJitter(
+            #     brightness=AUGMENTATION_STRENGTH * 0.1,
+            #     contrast=AUGMENTATION_STRENGTH * 0.1
+            # ),
+            # T_v2.RandomApply([
+            #     T_v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
+            # ], p=0.2)
         ])
 
-    # Normalize using computed channel statistics
-    transforms_list.append(
-        T_v2.Normalize(mean=CHANNEL_MEANS, std=CHANNEL_STDS)
-    )
+    # Remove normalization for now - it doesn't work with 6 channels out of the box
+    # We'll handle normalization manually in the dataset or use custom normalization
+    # transforms_list.append(
+    #     T_v2.Normalize(mean=CHANNEL_MEANS, std=CHANNEL_STDS)
+    # )
 
     return T_v2.Compose(transforms_list)
 
@@ -62,7 +63,7 @@ def rxrx1_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     """
     # Filter out failed samples
     valid_batch = [item for item in batch
-                   if item is not None and item['rgb_image'] is not None and item['label'] != -1]
+                   if item is not None and item['rgb_image'] is not None and 'error' not in item.get('metadata', {})]
 
     if not valid_batch:
         logger.warning("Received empty batch in collate function")
@@ -71,7 +72,6 @@ def rxrx1_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             'spectral_image': None,
             'label': torch.empty(0, dtype=torch.long),
             'plate_id': torch.empty(0, dtype=torch.long),
-            'stage': [],
             'id': torch.empty(0, dtype=torch.long)
         }
 
@@ -79,10 +79,9 @@ def rxrx1_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     batched_data = {
         'rgb_image': torch.stack([item['rgb_image'] for item in valid_batch]),
         'spectral_image': None,  # Not used for RxRx1
-        'label': torch.tensor([item['label'] for item in valid_batch], dtype=torch.long),
-        'plate_id': torch.tensor([item['plate_id'] for item in valid_batch], dtype=torch.long),
-        'stage': [item['stage'] for item in valid_batch],
-        'id': torch.tensor([item['id'] for item in valid_batch], dtype=torch.long)
+        'label': torch.stack([item['label'] for item in valid_batch]),
+        'plate_id': torch.stack([item['plate_id'] for item in valid_batch]),
+        'id': torch.stack([item['id'] for item in valid_batch])
     }
 
     return batched_data
@@ -104,13 +103,14 @@ def create_batch_aware_split(dataset: RxRx1Dataset,
 
         if STRATIFY_BY_PLATE and STRATIFY_BY_PERTURBATION:
             # Combine perturbation and plate for stratification
-            perturbation = row.get('sirna_id', 'unknown')
+            sirna_id = row.get('sirna_id', -1)  # Integer in RxRx1
             plate = row['plate']
-            strat_key = f"{perturbation}_{plate}"
+            strat_key = f"sirna_{sirna_id}_plate_{plate}"
         elif STRATIFY_BY_PERTURBATION:
-            strat_key = row.get('sirna_id', 'unknown')
+            sirna_id = row.get('sirna_id', -1)
+            strat_key = f"sirna_{sirna_id}"
         elif STRATIFY_BY_PLATE:
-            strat_key = row['plate']
+            strat_key = f"plate_{row['plate']}"
         else:
             strat_key = 0  # No stratification
 
@@ -185,6 +185,9 @@ def create_batch_aware_split(dataset: RxRx1Dataset,
         train_indices = indices_shuffled[n_test+n_val:].tolist()
 
     return train_indices, val_indices, test_indices
+# Replace the get_dataloaders function with this improved version:
+# Update the get_dataloaders function to reuse the base dataset:
+# In the get_dataloaders function, update the auto-detection:
 
 def get_dataloaders(
     dataset_root: str = RXRX1_DATASET_ROOT,
@@ -193,25 +196,57 @@ def get_dataloaders(
     num_workers: int = NUM_WORKERS,
     val_split_ratio: float = VALIDATION_SPLIT_RATIO,
     test_split_ratio: float = TEST_SPLIT_RATIO,
+    experiment: str = None,
     seed: int = 42
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Dict[str, Any]]:
-    """
-    Create train, validation, and test DataLoaders for RxRx1 dataset.
+    """Create train, validation, and test DataLoaders for RxRx1 dataset."""
 
-    Returns:
-        train_loader, val_loader, test_loader, dataset_info
-    """
     logger.info(f"Creating RxRx1 DataLoaders")
     logger.info(f"Dataset root: {dataset_root}")
     logger.info(f"Metadata: {metadata_path}")
     logger.info(f"Splits - Val: {val_split_ratio}, Test: {test_split_ratio}")
 
-    # Create base dataset to get metadata and class information
+    # Auto-detect experiment if not specified
+    if experiment is None:
+        import pandas as pd
+        metadata = pd.read_csv(metadata_path)
+
+        # UPDATED: Prefer experiments with train data AND images
+        available_image_experiments = []
+        train_experiments = []
+
+        images_root = Path(dataset_root)
+        if images_root.exists():
+            for exp_folder in images_root.iterdir():
+                if exp_folder.is_dir():
+                    exp_name = exp_folder.name
+                    # Check if this experiment exists in metadata
+                    if exp_name in metadata['experiment'].values:
+                        available_image_experiments.append(exp_name)
+
+                        # Check if this experiment has train data
+                        exp_data = metadata[metadata['experiment'] == exp_name]
+                        if 'train' in exp_data['dataset'].values:
+                            train_experiments.append(exp_name)
+
+        # Prefer experiments with train data
+        if train_experiments:
+            experiment = train_experiments[0]
+            logger.info(f"Auto-selected experiment with train data: {experiment}")
+            logger.info(f"Available experiments with train data: {train_experiments[:5]}...")  # Show first 5
+        elif available_image_experiments:
+            experiment = available_image_experiments[0]
+            logger.warning(f"No experiments with train data found. Using: {experiment} (test data only)")
+            logger.warning("Will use all available data for train/val/test splitting")
+        else:
+            raise ValueError("No experiments with images found!")
+
     base_dataset = RxRx1Dataset(
         root_dir=dataset_root,
         metadata_path=metadata_path,
         transform_rgb=None,
-        split="train"
+        split="train",
+        experiment=experiment
     )
 
     if len(base_dataset) == 0:
@@ -223,10 +258,12 @@ def get_dataloaders(
         'num_plates': base_dataset.num_plates,
         'classes': base_dataset.classes,
         'plates': base_dataset.plates,
-        'total_samples': len(base_dataset)
+        'total_samples': len(base_dataset),
+        'experiment': experiment
     }
 
     logger.info(f"Dataset info:")
+    logger.info(f"  Experiment: {experiment}")
     logger.info(f"  Genetic perturbations: {dataset_info['num_classes']}")
     logger.info(f"  Experimental plates: {dataset_info['num_plates']}")
     logger.info(f"  Total samples: {dataset_info['total_samples']}")
@@ -245,68 +282,69 @@ def get_dataloaders(
     train_transform = get_transforms(train=True)
     val_transform = get_transforms(train=False)
 
-    # Create datasets with transforms
+    # Create datasets with proper transforms
     train_dataset = RxRx1Dataset(
         root_dir=dataset_root,
         metadata_path=metadata_path,
         transform_rgb=train_transform,
         split="train",
+        experiment=experiment,
         class_to_idx=base_dataset.class_to_idx,
         classes=base_dataset.classes
     )
+
+    # GPU-optimized DataLoader settings
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'collate_fn': rxrx1_collate_fn,
+        'pin_memory': torch.cuda.is_available(),
+        'num_workers': NUM_WORKERS if torch.cuda.is_available() else 0,
+        'drop_last': True
+    }
 
     # Create data loaders
     train_subset = Subset(train_dataset, train_indices)
     train_loader = DataLoader(
         train_subset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        collate_fn=rxrx1_collate_fn,
-        pin_memory=True,
-        drop_last=True
+        **dataloader_kwargs
     )
 
-    # Validation loader
     val_loader = None
     if val_indices:
         val_dataset = RxRx1Dataset(
             root_dir=dataset_root,
             metadata_path=metadata_path,
             transform_rgb=val_transform,
-            split="train",
+            split="train",  # Use same split as train since we're subsetting
+            experiment=experiment,
             class_to_idx=base_dataset.class_to_idx,
             classes=base_dataset.classes
         )
         val_subset = Subset(val_dataset, val_indices)
         val_loader = DataLoader(
             val_subset,
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            collate_fn=rxrx1_collate_fn,
-            pin_memory=True
+            **dataloader_kwargs
         )
 
-    # Test loader
     test_loader = None
     if test_indices:
         test_dataset = RxRx1Dataset(
             root_dir=dataset_root,
             metadata_path=metadata_path,
             transform_rgb=val_transform,
-            split="train",
+            split="train",  # Use same split as train since we're subsetting
+            experiment=experiment,
             class_to_idx=base_dataset.class_to_idx,
             classes=base_dataset.classes
         )
         test_subset = Subset(test_dataset, test_indices)
         test_loader = DataLoader(
             test_subset,
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            collate_fn=rxrx1_collate_fn,
-            pin_memory=True
+            **dataloader_kwargs
         )
 
     return train_loader, val_loader, test_loader, dataset_info
+

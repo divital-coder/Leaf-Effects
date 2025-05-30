@@ -15,20 +15,23 @@ if torch.cuda.is_available():
 np.random.seed(RANDOM_SEED)
 
 # --- Core Paths ---
-# Update these paths based on your actual download location
-DATASET_BASE_PATH = "/path/to/your/rxrx1/download"
+# Updated to your actual RxRx1 dataset location
+DATASET_BASE_PATH = "/teamspace/studios/this_studio/Comprehensive-RxR1 cellular imaging dataset"
 
-# RxRx1 specific paths - adjust based on actual structure
-RXRX1_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "images")  # or "rxrx1_images"
+# RxRx1 specific paths - images and metadata are directly in the base path
+RXRX1_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "images")
 METADATA_CSV_PATH = os.path.join(DATASET_BASE_PATH, "metadata.csv")
 
 # For development with subset
 DEV_MODE = True  # Set to False for full dataset
 if DEV_MODE:
-    # Use smaller subset for development
-    RXRX1_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "images_subset") 
+    # For development, still use the same images path but limit data in other ways
+    # We'll handle subset logic in the dataset class rather than changing paths
     NUM_EPOCHS = 5  # Fewer epochs for testing
     BATCH_SIZE = 16  # Smaller batches for development
+else:
+    NUM_EPOCHS = 50  # Full training epochs
+    BATCH_SIZE = 32  # Full batch size
 
 # Output directories
 MODEL_SAVE_PATH = "saved_models"
@@ -41,18 +44,18 @@ for dir_path in [MODEL_SAVE_PATH, VISUALIZATION_DIR, RESULTS_DIR, LOGS_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # --- RxRx1 Dataset Constants ---
-# RxRx1 has 6 fluorescence channels
+# RxRx1 has 6 fluorescence channels (w1-w6, not named channels)
 NUM_CHANNELS = 6
-CHANNEL_NAMES = ['DNA', 'ER', 'RNA', 'AGP', 'Mito', 'SYTO']
+CHANNEL_NAMES = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6']  # Actual RxRx1 channel naming
 
 # Image properties (RxRx1 original: 512x512, we'll resize to 224x224)
 ORIGINAL_IMAGE_SIZE = (512, 512)
 IMAGE_SIZE_RGB = (224, 224)  # Standard input size for models
 IMAGE_SIZE_SPECTRAL = (224, 224)  # Same as RGB for this project
 
-# RxRx1 dataset statistics
-NUM_GENETIC_PERTURBATIONS = 1108  # siRNA classes
-NUM_EXPERIMENTAL_PLATES = 51      # Batch sources
+# RxRx1 dataset statistics (updated from metadata schema)
+NUM_GENETIC_PERTURBATIONS = 1138  # siRNA classes (corrected from 1108)
+NUM_EXPERIMENTAL_PLATES = 51      # Batch sources (varies by experiment)
 TOTAL_IMAGES_APPROX = 125510
 
 # Normalization parameters (will be computed from training data)
@@ -60,9 +63,21 @@ TOTAL_IMAGES_APPROX = 125510
 CHANNEL_MEANS = [0.485, 0.456, 0.406, 0.485, 0.456, 0.406]
 CHANNEL_STDS = [0.229, 0.224, 0.225, 0.229, 0.224, 0.225]
 
+
 # --- Training Hyperparameters ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# GPU-optimized settings
+if torch.cuda.is_available():
+    BATCH_SIZE = 32          # Can handle larger batches
+    NUM_WORKERS = 4          # Re-enable multiprocessing
+    PIN_MEMORY = True        # Faster CPU->GPU transfer
+    NUM_EPOCHS = 50          # Full training
+else:
+    BATCH_SIZE = 16          # Smaller for CPU
+    NUM_WORKERS = 0          # Avoid multiprocessing issues
+    PIN_MEMORY = False       # Not useful for CPU
+    NUM_EPOCHS = 5           # Quick testing
 # Model configurations
 MODEL_NAME = "resnet50"  # Feature extractor backbone
 PRETRAINED = True

@@ -1,11 +1,10 @@
-# models.py
+# models.py - Neural network models for RxRx1 batch effect correction
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Function
-import torchvision.models as tv_models
+import torchvision.models as models
 import timm
 import logging
+from torch.autograd import Function
 from typing import Dict, Any, Tuple
 
 from config import MODEL_NAME, PRETRAINED, NUM_CHANNELS
@@ -13,11 +12,7 @@ from config import MODEL_NAME, PRETRAINED, NUM_CHANNELS
 logger = logging.getLogger(__name__)
 
 class GradientReversalLayer(Function):
-    """
-    Gradient Reversal Layer for Domain Adversarial Neural Networks.
-    During forward pass: acts as identity
-    During backward pass: reverses gradient and scales by alpha
-    """
+    """Gradient Reversal Layer for Domain Adversarial Training."""
 
     @staticmethod
     def forward(ctx, x, alpha):
@@ -41,43 +36,38 @@ class FeatureExtractor(nn.Module):
 
     def __init__(self, backbone_name: str = MODEL_NAME, pretrained: bool = PRETRAINED):
         super().__init__()
-        self.backbone_name = backbone_name
 
         if backbone_name == "resnet50":
-            self.backbone = tv_models.resnet50(pretrained=pretrained)
-
-            # Modify first conv layer for 6-channel input (fluorescence channels)
-            original_conv1 = self.backbone.conv1
+            self.backbone = models.resnet50(pretrained=pretrained)
+            # Modify first conv layer for 6 channels
             self.backbone.conv1 = nn.Conv2d(
                 NUM_CHANNELS, 64, kernel_size=7, stride=2, padding=3, bias=False
             )
 
-            # Initialize new conv layer weights intelligently
             if pretrained:
+                # Initialize new conv layer with pretrained weights (average across channels)
                 with torch.no_grad():
-                    # Average RGB weights and replicate for 6 channels
-                    rgb_weights = original_conv1.weight  # [64, 3, 7, 7]
-                    new_weights = rgb_weights.repeat(1, 2, 1, 1)  # [64, 6, 7, 7]
-                    self.backbone.conv1.weight = nn.Parameter(new_weights)
+                    pretrained_weight = models.resnet50(pretrained=True).conv1.weight
+                    new_weight = pretrained_weight.mean(dim=1, keepdim=True).repeat(1, NUM_CHANNELS, 1, 1)
+                    self.backbone.conv1.weight = nn.Parameter(new_weight)
+                    logger.info("Initialized 6-channel conv1 with averaged pretrained weights")
 
-            # Remove classification head
             self.feature_dim = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
 
         elif backbone_name == "resnet18":
-            self.backbone = tv_models.resnet18(pretrained=pretrained)
-
-            # Modify for 6-channel input
-            original_conv1 = self.backbone.conv1
+            self.backbone = models.resnet18(pretrained=pretrained)
+            # Modify first conv layer for 6 channels
             self.backbone.conv1 = nn.Conv2d(
                 NUM_CHANNELS, 64, kernel_size=7, stride=2, padding=3, bias=False
             )
 
             if pretrained:
+                # Initialize new conv layer with pretrained weights
                 with torch.no_grad():
-                    rgb_weights = original_conv1.weight
-                    new_weights = rgb_weights.repeat(1, 2, 1, 1)
-                    self.backbone.conv1.weight = nn.Parameter(new_weights)
+                    pretrained_weight = models.resnet18(pretrained=True).conv1.weight
+                    new_weight = pretrained_weight.mean(dim=1, keepdim=True).repeat(1, NUM_CHANNELS, 1, 1)
+                    self.backbone.conv1.weight = nn.Parameter(new_weight)
 
             self.feature_dim = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
@@ -88,8 +78,8 @@ class FeatureExtractor(nn.Module):
                 self.backbone = timm.create_model(
                     backbone_name,
                     pretrained=pretrained,
-                    in_chans=NUM_CHANNELS,  # timm supports in_chans parameter
-                    num_classes=0  # Remove head, return features
+                    in_chans=NUM_CHANNELS,
+                    num_classes=0  # Remove classification head
                 )
                 self.feature_dim = self.backbone.num_features
                 logger.info(f"Loaded {backbone_name} from timm with {NUM_CHANNELS} input channels")
@@ -171,87 +161,94 @@ class DANNModel(nn.Module):
         super().__init__()
 
         self.feature_extractor = FeatureExtractor(backbone_name, pretrained)
-        feature_dim = self.feature_extractor.feature_dim
-
-        self.perturbation_classifier = PerturbationClassifier(feature_dim, num_perturbations)
-        self.batch_discriminator = BatchDiscriminator(feature_dim, num_plates)
+        self.perturbation_classifier = PerturbationClassifier(
+            self.feature_extractor.feature_dim, num_perturbations
+        )
+        self.batch_discriminator = BatchDiscriminator(
+            self.feature_extractor.feature_dim, num_plates
+        )
 
         self.num_perturbations = num_perturbations
         self.num_plates = num_plates
 
-        logger.info(f"DANN Model initialized:")
-        logger.info(f"  Backbone: {backbone_name}")
-        logger.info(f"  Feature dim: {feature_dim}")
-        logger.info(f"  Genetic perturbations: {num_perturbations}")
-        logger.info(f"  Experimental plates: {num_plates}")
-
-    def forward(self, x, alpha=1.0):
+    def forward(self, x: torch.Tensor, alpha: float = 1.0) -> Dict[str, torch.Tensor]:
         """
         Forward pass through DANN.
 
         Args:
-            x: 6-channel fluorescence images [batch_size, 6, H, W]
+            x: Input 6-channel images (B, 6, H, W)
             alpha: Gradient reversal strength
 
         Returns:
-            Dict with perturbation predictions, batch predictions, and features
+            Dictionary with perturbation and batch predictions
         """
-        # Extract batch-invariant features
+        # Extract features
         features = self.feature_extractor(x)
 
         # Predict genetic perturbations (main biological task)
         perturbation_predictions = self.perturbation_classifier(features)
 
-        # Predict experimental plate (adversarial task)
+        # Predict experimental plates (adversarial task)
         batch_predictions = self.batch_discriminator(features, alpha)
 
         return {
-            'features': features,
             'perturbation_predictions': perturbation_predictions,
-            'batch_predictions': batch_predictions
+            'batch_predictions': batch_predictions,
+            'features': features
         }
 
-# Update baseline model to handle 6 channels
-def get_baseline_model(model_name: str, num_classes: int, pretrained: bool = True) -> nn.Module:
+class BaselineModel(nn.Module):
     """
-    Create baseline model for 6-channel RxRx1 images without adversarial training.
-    Updated to handle fluorescence microscopy data.
+    Baseline model without adversarial training.
+    Used for comparison to show batch effects.
     """
-    logger.info(f"Loading baseline model: {model_name} for {num_classes} classes (6-channel input)")
 
-    # Use the FeatureExtractor + simple classifier
-    feature_extractor = FeatureExtractor(model_name, pretrained)
-    classifier = PerturbationClassifier(feature_extractor.feature_dim, num_classes)
+    def __init__(self,
+                 num_classes: int,
+                 backbone_name: str = MODEL_NAME,
+                 pretrained: bool = PRETRAINED):
+        super().__init__()
 
-    class BaselineModel(nn.Module):
-        def __init__(self, feature_extractor, classifier):
-            super().__init__()
-            self.feature_extractor = feature_extractor
-            self.classifier = classifier
+        self.feature_extractor = FeatureExtractor(backbone_name, pretrained)
+        self.classifier = PerturbationClassifier(
+            self.feature_extractor.feature_dim, num_classes
+        )
 
-        def forward(self, x):
-            features = self.feature_extractor(x)
-            predictions = self.classifier(features)
-            return predictions
+        self.num_classes = num_classes
 
-    return BaselineModel(feature_extractor, classifier)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through baseline model."""
+        features = self.feature_extractor(x)
+        predictions = self.classifier(features)
+        return predictions
 
-def get_model(model_type: str, num_classes: int, num_domains: int = None, **kwargs):
+def get_model(model_type: str,
+              num_classes: int,
+              num_plates: int = None,
+              backbone_name: str = MODEL_NAME,
+              pretrained: bool = PRETRAINED) -> nn.Module:
     """
-    Factory function for creating models.
+    Factory function to create models.
 
     Args:
-        model_type: 'dann' for adversarial or 'baseline' for standard
+        model_type: "dann" or "baseline"
         num_classes: Number of genetic perturbation classes
-        num_domains: Number of experimental plates (for DANN)
+        num_plates: Number of experimental plates (required for DANN)
+        backbone_name: Feature extractor backbone
+        pretrained: Use pretrained weights
+
+    Returns:
+        Initialized model
     """
-    if model_type.lower() == 'dann':
-        if num_domains is None:
-            raise ValueError("num_domains (plates) required for DANN model")
-        return DANNModel(num_classes, num_domains, **kwargs)
-
-    elif model_type.lower() == 'baseline':
-        return get_baseline_model(MODEL_NAME, num_classes, **kwargs)
-
+    if model_type.lower() == "dann":
+        if num_plates is None:
+            raise ValueError("num_plates is required for DANN model")
+        model = DANNModel(num_classes, num_plates, backbone_name, pretrained)
+        logger.info(f"Created DANN model: {num_classes} classes, {num_plates} plates")
+    elif model_type.lower() == "baseline":
+        model = BaselineModel(num_classes, backbone_name, pretrained)
+        logger.info(f"Created baseline model: {num_classes} classes")
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+    return model

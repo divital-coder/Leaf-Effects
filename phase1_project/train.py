@@ -11,11 +11,14 @@ import numpy as np
 
 import torchmetrics
 
+# Add this import at the top with other imports:
 from config import (
     DEVICE, MODEL_NAME, PRETRAINED, RXRX1_DATASET_ROOT, NUM_EPOCHS,
     LEARNING_RATE, WEIGHT_DECAY, MODEL_SAVE_PATH, METRICS_AVERAGE,
-    LAMBDA_ADVERSARIAL, GRADIENT_REVERSAL_ALPHA, MODEL_TYPE
+    LAMBDA_ADVERSARIAL, GRADIENT_REVERSAL_ALPHA, MODEL_TYPE,
+    METADATA_CSV_PATH  # Add this missing import
 )
+
 from data_utils import get_dataloaders
 from models import get_model
 
@@ -242,8 +245,25 @@ def main():
     logger.info(f"Using device: {DEVICE}")
     logger.info("Starting RxRx1 Batch Effect Correction Training")
 
+    # Verify paths exist before starting
+    from pathlib import Path
+    if not Path(RXRX1_DATASET_ROOT).exists():
+        logger.error(f"Dataset root not found: {RXRX1_DATASET_ROOT}")
+        logger.error("Please update DATASET_BASE_PATH in config.py to point to your RxRx1 download")
+        return
+
+    if not Path(METADATA_CSV_PATH).exists():
+        logger.error(f"Metadata file not found: {METADATA_CSV_PATH}")
+        logger.error("Please ensure metadata.csv is in your dataset directory")
+        return
+
     # Data Loading
-    train_loader, val_loader, test_loader, dataset_info = get_dataloaders()
+    try:
+        train_loader, val_loader, test_loader, dataset_info = get_dataloaders()
+    except Exception as e:
+        logger.error(f"Failed to create data loaders: {e}")
+        logger.error("Please check your dataset paths and structure")
+        return
 
     num_classes = dataset_info['num_classes']
     num_plates = dataset_info.get('num_plates', 1)
