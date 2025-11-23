@@ -1,350 +1,231 @@
-# data_utils.py - RxRx1 data utilities with batch-aware splitting
+# data_utils.py
 import logging
 from typing import Tuple, Dict, Optional, List, Any
 from pathlib import Path
 
 import torch
-import torchvision.transforms.v2 as T_v2
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, random_split
 from sklearn.model_selection import train_test_split
-import numpy as np
 
-from dataset import RxRx1Dataset
+from dataset import CottonLeafDataset
+from transforms import get_rgb_transforms
 from config import (
-    RXRX1_DATASET_ROOT, METADATA_CSV_PATH, IMAGE_SIZE_RGB, BATCH_SIZE, NUM_WORKERS,
-    VALIDATION_SPLIT_RATIO, TEST_SPLIT_RATIO, CHANNEL_MEANS, CHANNEL_STDS,
-    USE_AUGMENTATION, AUGMENTATION_STRENGTH, STRATIFY_BY_PLATE, STRATIFY_BY_PERTURBATION
+    IMAGE_SIZE_RGB, IMAGE_SIZE_SPECTRAL, BATCH_SIZE, NUM_WORKERS,
+    DEFAULT_STAGE_MAP, VALIDATION_SPLIT_RATIO, TEST_SPLIT_RATIO
 )
 
 logger = logging.getLogger(__name__)
 
-def get_transforms(train: bool = True) -> T_v2.Compose:
+def custom_collate_fn_for_training(batch: List[Dict[str, Any]]) \
+        -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
-    Get transforms for 6-channel RxRx1 fluorescence images.
-
-    Args:
-        train: If True, applies data augmentations
+    Collate function for training. Handles Optional spectral_tensors.
+    Filters out items where rgb_image is None (due to loading error).
+    Returns: rgb_batch, spectral_batch (can be None), label_batch
     """
-    transforms_list = []
+    valid_batch = [item for item in batch if item["rgb_image"] is not None and item["label"] != -1]
 
-    # Resize from 512x512 to target size
-    transforms_list.append(T_v2.Resize(IMAGE_SIZE_RGB, interpolation=T_v2.InterpolationMode.BILINEAR))
+    if not valid_batch: # All items in batch failed to load
+        # This case should be rare with drop_last=True and a reasonable batch size.
+        # If it happens, we might return empty tensors or raise an error.
+        # For now, let's assume it won't completely empty a batch if dataset is large enough.
+        # If BATCH_SIZE is 1 and that one fails, this will be an issue.
+        # The DataLoader should ideally skip such problematic indices if identified beforehand.
+        logger.warning("Collate function received an entirely empty or error-filled batch.")
+        # Depending on strictness, you might raise an error or return dummy tensors.
+        # For now, returning empty tensors and hoping the training loop handles it gracefully (e.g., skips batch).
+        # This requires the training loop to check batch size.
+        return torch.empty(0), None, torch.empty(0, dtype=torch.long)
 
-    if train and USE_AUGMENTATION:
-        # Augmentations suitable for fluorescence microscopy
-        transforms_list.extend([
-            T_v2.RandomHorizontalFlip(p=0.5),
-            T_v2.RandomVerticalFlip(p=0.5),
-            T_v2.RandomRotation(degrees=15),
-            # Remove ColorJitter and GaussianBlur - they don't work with 6 channels
-            # T_v2.ColorJitter(
-            #     brightness=AUGMENTATION_STRENGTH * 0.1,
-            #     contrast=AUGMENTATION_STRENGTH * 0.1
-            # ),
-            # T_v2.RandomApply([
-            #     T_v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
-            # ], p=0.2)
-        ])
 
-    # Remove normalization for now - it doesn't work with 6 channels out of the box
-    # We'll handle normalization manually in the dataset or use custom normalization
-    # transforms_list.append(
-    #     T_v2.Normalize(mean=CHANNEL_MEANS, std=CHANNEL_STDS)
-    # )
+    rgb_images = torch.stack([item["rgb_image"] for item in valid_batch])
+    labels = torch.tensor([item["label"] for item in valid_batch], dtype=torch.long)
+    
+    batched_spectral: Optional[torch.Tensor] = None
+    has_any_spectral_data = any(item["spectral_image"] is not None for item in valid_batch)
 
-    return T_v2.Compose(transforms_list)
+    if has_any_spectral_data:
+        spectral_images_processed = []
+        ref_spectral_shape = None
+        # Find a reference shape from the first available spectral image
+        for item in valid_batch:
+            if item["spectral_image"] is not None:
+                ref_spectral_shape = item["spectral_image"].shape
+                break
+        
+        if ref_spectral_shape is None: # Should not happen if has_any_spectral_data is True
+             # Fallback if logic error, though one spectral image should exist
+            ref_spectral_shape = (1, IMAGE_SIZE_SPECTRAL[0], IMAGE_SIZE_SPECTRAL[1]) # C, H, W
 
-def rxrx1_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """
-    Custom collate function for RxRx1 dataset handling batch metadata.
-
-    Returns:
-        Dict with all necessary batch information including plate IDs
-    """
-    # Filter out failed samples
-    valid_batch = [item for item in batch
-                   if item is not None and item['rgb_image'] is not None and 'error' not in item.get('metadata', {})]
-
-    if not valid_batch:
-        logger.warning("Received empty batch in collate function")
-        return {
-            'rgb_image': torch.empty(0),
-            'spectral_image': None,
-            'label': torch.empty(0, dtype=torch.long),
-            'plate_id': torch.empty(0, dtype=torch.long),
-            'id': torch.empty(0, dtype=torch.long)
-        }
-
-    # Stack tensors
-    batched_data = {
-        'rgb_image': torch.stack([item['rgb_image'] for item in valid_batch]),
-        'spectral_image': None,  # Not used for RxRx1
-        'label': torch.stack([item['label'] for item in valid_batch]),
-        'plate_id': torch.stack([item['plate_id'] for item in valid_batch]),
-        'id': torch.stack([item['id'] for item in valid_batch])
-    }
-
-    return batched_data
-
-def create_batch_aware_split(dataset: RxRx1Dataset,
-                           val_split_ratio: float,
-                           test_split_ratio: float,
-                           seed: int = 42) -> Tuple[List[int], List[int], List[int]]:
-    """
-    Create stratified splits that ensure both genetic perturbations and
-    experimental plates are represented across train/val/test sets.
-    """
-    indices = list(range(len(dataset)))
-
-    # Create stratification keys
-    stratify_labels = []
-    for idx in indices:
-        row = dataset.metadata.iloc[idx]
-
-        if STRATIFY_BY_PLATE and STRATIFY_BY_PERTURBATION:
-            # Combine perturbation and plate for stratification
-            sirna_id = row.get('sirna_id', -1)  # Integer in RxRx1
-            plate = row['plate']
-            strat_key = f"sirna_{sirna_id}_plate_{plate}"
-        elif STRATIFY_BY_PERTURBATION:
-            sirna_id = row.get('sirna_id', -1)
-            strat_key = f"sirna_{sirna_id}"
-        elif STRATIFY_BY_PLATE:
-            strat_key = f"plate_{row['plate']}"
-        else:
-            strat_key = 0  # No stratification
-
-        stratify_labels.append(strat_key)
-
-    # Handle case where some strata have too few samples
-    from collections import Counter
-    strat_counts = Counter(stratify_labels)
-    min_samples = min(strat_counts.values())
-
-    if min_samples < 3:  # Need at least 3 for train/val/test
-        logger.warning(f"Some strata have only {min_samples} samples. Falling back to perturbation-only stratification.")
-        stratify_labels = [dataset.metadata.iloc[idx].get('sirna_id', 'unknown') for idx in indices]
-
-        # Check again
-        strat_counts = Counter(stratify_labels)
-        min_samples = min(strat_counts.values())
-        if min_samples < 3:
-            logger.warning("Still too few samples per stratum. Using random splits.")
-            stratify_labels = None
-
-    # Perform splits
-    try:
-        if test_split_ratio > 0:
-            # First split: train+val vs test
-            train_val_indices, test_indices = train_test_split(
-                indices,
-                test_size=test_split_ratio,
-                stratify=stratify_labels,
-                random_state=seed
-            )
-
-            # Second split: train vs val
-            if val_split_ratio > 0:
-                train_val_labels = [stratify_labels[i] for i in train_val_indices] if stratify_labels else None
-                adjusted_val_ratio = val_split_ratio / (1.0 - test_split_ratio)
-
-                train_indices, val_indices = train_test_split(
-                    train_val_indices,
-                    test_size=adjusted_val_ratio,
-                    stratify=train_val_labels,
-                    random_state=seed
-                )
+        for item in valid_batch:
+            if item["spectral_image"] is not None:
+                spectral_images_processed.append(item["spectral_image"])
             else:
-                train_indices = train_val_indices
-                val_indices = []
-        else:
-            # Only train/val split
-            if val_split_ratio > 0:
-                train_indices, val_indices = train_test_split(
-                    indices,
-                    test_size=val_split_ratio,
-                    stratify=stratify_labels,
-                    random_state=seed
-                )
-            else:
-                train_indices = indices
-                val_indices = []
-            test_indices = []
+                spectral_images_processed.append(torch.zeros(ref_spectral_shape, dtype=torch.float32))
+        try:
+            batched_spectral = torch.stack(spectral_images_processed)
+        except RuntimeError as e:
+            logger.error(f"RuntimeError stacking spectral images: {e}. Shapes:")
+            for i, s_img in enumerate(spectral_images_processed):
+                logger.error(f"  Item {i} shape: {s_img.shape if s_img is not None else 'None'}")
+            batched_spectral = None # Fallback
+            logger.error("Fallback: Batched spectral set to None due to stacking error.")
+            
+    return rgb_images, batched_spectral, labels
 
-    except ValueError as e:
-        logger.warning(f"Stratified split failed: {e}. Using random splits.")
-        # Fallback to random splits
-        np.random.seed(seed)
-        indices_shuffled = np.random.permutation(indices)
-
-        n_test = int(test_split_ratio * len(indices))
-        n_val = int(val_split_ratio * len(indices))
-
-        test_indices = indices_shuffled[:n_test].tolist()
-        val_indices = indices_shuffled[n_test:n_test+n_val].tolist()
-        train_indices = indices_shuffled[n_test+n_val:].tolist()
-
-    return train_indices, val_indices, test_indices
-# Replace the get_dataloaders function with this improved version:
-# Update the get_dataloaders function to reuse the base dataset:
-# In the get_dataloaders function, update the auto-detection:
 
 def get_dataloaders(
-    dataset_root: str = RXRX1_DATASET_ROOT,
-    metadata_path: str = METADATA_CSV_PATH,
+    dataset_root: str,
+    apply_progression: bool = False,
+    use_spectral: bool = False,
     batch_size: int = BATCH_SIZE,
     num_workers: int = NUM_WORKERS,
     val_split_ratio: float = VALIDATION_SPLIT_RATIO,
     test_split_ratio: float = TEST_SPLIT_RATIO,
-    experiment: str = None,
     seed: int = 42
-) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Dict[str, Any]]:
-    """Create train, validation, and test DataLoaders for RxRx1 dataset."""
+) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], int, List[str]]:
+    """
+    Creates and returns train, validation, and optional test DataLoaders.
+    Returns: train_loader, val_loader, test_loader (or None), num_classes, class_names
+    """
+    logger.info(f"Creating DataLoaders for dataset at: {dataset_root}")
+    logger.info(f"Apply progression: {apply_progression}, Use spectral: {use_spectral}")
+    logger.info(f"Val split: {val_split_ratio}, Test split: {test_split_ratio}")
 
-    logger.info(f"Creating RxRx1 DataLoaders")
-    logger.info(f"Dataset root: {dataset_root}")
-    logger.info(f"Metadata: {metadata_path}")
-    logger.info(f"Splits - Val: {val_split_ratio}, Test: {test_split_ratio}")
+    transform_train_rgb = get_rgb_transforms(train=True, image_size=IMAGE_SIZE_RGB)
+    transform_val_rgb = get_rgb_transforms(train=False, image_size=IMAGE_SIZE_RGB)
+    # Spectral transforms can be added here if needed, for now assumed minimal processing in dataset
 
-    # Auto-detect experiment if not specified
-    if experiment is None:
-        import pandas as pd
-        metadata = pd.read_csv(metadata_path)
-
-        # UPDATED: Prefer experiments with train data AND images
-        available_image_experiments = []
-        train_experiments = []
-
-        images_root = Path(dataset_root)
-        if images_root.exists():
-            for exp_folder in images_root.iterdir():
-                if exp_folder.is_dir():
-                    exp_name = exp_folder.name
-                    # Check if this experiment exists in metadata
-                    if exp_name in metadata['experiment'].values:
-                        available_image_experiments.append(exp_name)
-
-                        # Check if this experiment has train data
-                        exp_data = metadata[metadata['experiment'] == exp_name]
-                        if 'train' in exp_data['dataset'].values:
-                            train_experiments.append(exp_name)
-
-        # Prefer experiments with train data
-        if train_experiments:
-            experiment = train_experiments[0]
-            logger.info(f"Auto-selected experiment with train data: {experiment}")
-            logger.info(f"Available experiments with train data: {train_experiments[:5]}...")  # Show first 5
-        elif available_image_experiments:
-            experiment = available_image_experiments[0]
-            logger.warning(f"No experiments with train data found. Using: {experiment} (test data only)")
-            logger.warning("Will use all available data for train/val/test splitting")
-        else:
-            raise ValueError("No experiments with images found!")
-
-    base_dataset = RxRx1Dataset(
+    # Instantiate the full dataset first to get classes and class_to_idx
+    full_dataset_check = CottonLeafDataset(
         root_dir=dataset_root,
-        metadata_path=metadata_path,
-        transform_rgb=None,
-        split="train",
-        experiment=experiment
+        transform_rgb=None, # Not needed yet, just for metadata
+        apply_progression=False,
+        use_spectral=False
     )
+    class_names = full_dataset_check.classes
+    class_to_idx = full_dataset_check.class_to_idx
+    num_classes = len(class_names)
+    logger.info(f"Discovered {num_classes} classes: {class_names}")
+    if num_classes == 0:
+        raise ValueError("No classes found in the dataset. Please check the dataset directory structure.")
 
-    if len(base_dataset) == 0:
-        raise ValueError("Dataset is empty. Check paths and metadata.")
-
-    # Extract dataset information
-    dataset_info = {
-        'num_classes': base_dataset.num_classes,
-        'num_plates': base_dataset.num_plates,
-        'classes': base_dataset.classes,
-        'plates': base_dataset.plates,
-        'total_samples': len(base_dataset),
-        'experiment': experiment
-    }
-
-    logger.info(f"Dataset info:")
-    logger.info(f"  Experiment: {experiment}")
-    logger.info(f"  Genetic perturbations: {dataset_info['num_classes']}")
-    logger.info(f"  Experimental plates: {dataset_info['num_plates']}")
-    logger.info(f"  Total samples: {dataset_info['total_samples']}")
-
-    # Create batch-aware splits
-    train_indices, val_indices, test_indices = create_batch_aware_split(
-        base_dataset, val_split_ratio, test_split_ratio, seed
-    )
-
-    logger.info(f"Split sizes:")
-    logger.info(f"  Train: {len(train_indices)}")
-    logger.info(f"  Validation: {len(val_indices)}")
-    logger.info(f"  Test: {len(test_indices)}")
-
-    # Create transforms
-    train_transform = get_transforms(train=True)
-    val_transform = get_transforms(train=False)
-
-    # Create datasets with proper transforms
-    train_dataset = RxRx1Dataset(
+    # Now create datasets with actual transforms
+    dataset_train = CottonLeafDataset(
         root_dir=dataset_root,
-        metadata_path=metadata_path,
-        transform_rgb=train_transform,
-        split="train",
-        experiment=experiment,
-        class_to_idx=base_dataset.class_to_idx,
-        classes=base_dataset.classes
+        transform_rgb=transform_train_rgb,
+        stage_map=DEFAULT_STAGE_MAP,
+        apply_progression=apply_progression,
+        use_spectral=use_spectral,
+        class_to_idx=class_to_idx, # Pass shared mapping
+        classes=class_names
     )
+    dataset_val = CottonLeafDataset(
+        root_dir=dataset_root, # Base dataset for val/test uses same root
+        transform_rgb=transform_val_rgb,
+        stage_map=DEFAULT_STAGE_MAP,
+        apply_progression=False, # Typically no progression sim for val/test
+        use_spectral=use_spectral,
+        class_to_idx=class_to_idx,
+        classes=class_names
+    )
+    
+    # Splitting logic
+    dataset_size = len(dataset_train) # Use train dataset instance as reference for size
+    indices = list(range(dataset_size))
+    labels_for_split = [dataset_train.images_metadata[i]['label'] for i in indices] # Get all labels for stratification
 
-    # GPU-optimized DataLoader settings
-    dataloader_kwargs = {
-        'batch_size': batch_size,
-        'collate_fn': rxrx1_collate_fn,
-        'pin_memory': torch.cuda.is_available(),
-        'num_workers': NUM_WORKERS if torch.cuda.is_available() else 0,
-        'drop_last': True
-    }
+    train_indices, val_indices = [], []
+    test_indices = [] # Keep test_indices separate
 
-    # Create data loaders
-    train_subset = Subset(train_dataset, train_indices)
+    if test_split_ratio > 0:
+        train_val_indices, test_indices = train_test_split(
+            indices,
+            test_size=test_split_ratio,
+            stratify=[labels_for_split[i] for i in indices], # Stratify on all available labels
+            random_state=seed
+        )
+        # Stratify again for train/val from the train_val_indices pool
+        # Adjust val_split_ratio to be relative to the train_val set
+        adjusted_val_split_ratio = val_split_ratio / (1.0 - test_split_ratio) if (1.0 - test_split_ratio) > 0 else 0
+        if adjusted_val_split_ratio > 0 and adjusted_val_split_ratio < 1:
+            train_indices, val_indices = train_test_split(
+                train_val_indices,
+                test_size=adjusted_val_split_ratio,
+                stratify=[labels_for_split[i] for i in train_val_indices],
+                random_state=seed
+            )
+        else: # If adjusted_val_split is 0 or >= 1 (e.g. test_split_ratio was too high)
+            train_indices = train_val_indices # All remaining go to train, no validation set
+            val_indices = []
+    elif val_split_ratio > 0 : # No test split, only train/val
+        train_indices, val_indices = train_test_split(
+            indices,
+            test_size=val_split_ratio,
+            stratify=labels_for_split,
+            random_state=seed
+        )
+    else: # No test or val split, all data for training
+        train_indices = indices
+        val_indices = []
+
+    if not train_indices:
+        raise ValueError("Training set is empty after splitting. Check split ratios and dataset size.")
+
+    train_subset = Subset(dataset_train, train_indices)
+    val_subset = Subset(dataset_val, val_indices) if val_indices else None # dataset_val uses val_transforms
+    
+    logger.info(f"Dataset split: Train: {len(train_subset)} samples")
+    if val_subset:
+        logger.info(f"Validation: {len(val_subset)} samples")
+    else:
+        logger.info("Validation: 0 samples (val_split_ratio might be 0 or too small)")
+    
     train_loader = DataLoader(
         train_subset,
+        batch_size=batch_size,
         shuffle=True,
-        **dataloader_kwargs
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn_for_training,
+        pin_memory=True,
+        drop_last=True # Good for training stability if last batch is small
     )
-
+    
     val_loader = None
-    if val_indices:
-        val_dataset = RxRx1Dataset(
-            root_dir=dataset_root,
-            metadata_path=metadata_path,
-            transform_rgb=val_transform,
-            split="train",  # Use same split as train since we're subsetting
-            experiment=experiment,
-            class_to_idx=base_dataset.class_to_idx,
-            classes=base_dataset.classes
-        )
-        val_subset = Subset(val_dataset, val_indices)
+    if val_subset and len(val_subset) > 0:
         val_loader = DataLoader(
             val_subset,
+            batch_size=batch_size,
             shuffle=False,
-            **dataloader_kwargs
+            num_workers=num_workers,
+            collate_fn=custom_collate_fn_for_training,
+            pin_memory=True
         )
 
     test_loader = None
     if test_indices:
-        test_dataset = RxRx1Dataset(
+        # Test dataset should use val_transforms (no heavy augmentation)
+        dataset_test = CottonLeafDataset(
             root_dir=dataset_root,
-            metadata_path=metadata_path,
-            transform_rgb=val_transform,
-            split="train",  # Use same split as train since we're subsetting
-            experiment=experiment,
-            class_to_idx=base_dataset.class_to_idx,
-            classes=base_dataset.classes
+            transform_rgb=transform_val_rgb,
+            stage_map=DEFAULT_STAGE_MAP,
+            apply_progression=False,
+            use_spectral=use_spectral,
+            class_to_idx=class_to_idx,
+            classes=class_names
         )
-        test_subset = Subset(test_dataset, test_indices)
-        test_loader = DataLoader(
-            test_subset,
-            shuffle=False,
-            **dataloader_kwargs
-        )
+        test_subset = Subset(dataset_test, test_indices)
+        logger.info(f"Test: {len(test_subset)} samples")
+        if len(test_subset) > 0:
+            test_loader = DataLoader(
+                test_subset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=custom_collate_fn_for_training,
+                pin_memory=True
+            )
+    else:
+        logger.info("Test: 0 samples (test_split_ratio is 0)")
 
-    return train_loader, val_loader, test_loader, dataset_info
-
+    return train_loader, val_loader, test_loader, num_classes, class_names

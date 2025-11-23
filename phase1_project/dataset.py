@@ -1,370 +1,181 @@
-# dataset.py - RxRx1 Cellular Image Dataset for Batch Effect Analysis
+# dataset.py
 import os
-import pandas as pd
 from pathlib import Path
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import numpy as np
 from torch.utils.data import Dataset
-import torchvision.transforms.v2 as T_v2
-from typing import Tuple, Optional, Dict, List, Any, Callable  # Add Callable here
+import torchvision.transforms as T_old # For T.Resize in _simulate_ndvi if needed
+import torchvision.transforms.v2 as T_v2 # For main transforms
+from typing import Tuple, Optional, Dict, List, Any
 import logging
 
-from config import (
-    RXRX1_DATASET_ROOT, METADATA_CSV_PATH, NUM_CHANNELS, CHANNEL_NAMES,
-    IMAGE_SIZE_RGB, ORIGINAL_IMAGE_SIZE, DEFAULT_STAGE_MAP, DEV_MODE
-)
+from config import DEFAULT_STAGE_MAP, IMAGE_SIZE_SPECTRAL, IMAGE_SIZE_RGB
+from progression import DiseaseProgressionSimulator
 
 logger = logging.getLogger(__name__)
 
-class RxRx1Dataset(Dataset):
-    """
-    Dataset class for RxRx1 cellular images focusing on batch effect correction.
+class CottonLeafDataset(Dataset):
+    """Custom dataset for cotton leaf disease detection."""
 
-    The RxRx1 dataset contains 6-channel fluorescence microscopy images of cells
-    treated with various siRNA (genetic perturbations). Each image belongs to a
-    specific experimental plate which represents a potential batch effect source.
+    def __init__(self, root_dir: str,
+                 transform_rgb: Optional[T_v2.Compose] = None,
+                 transform_spectral: Optional[T_v2.Compose] = None, # If spectral needs different transforms
+                 stage_map: Optional[Dict[int, str]] = None,
+                 apply_progression: bool = False,
+                 use_spectral: bool = False,
+                 class_to_idx: Optional[Dict[str, int]] = None, # Pass this if pre-defined
+                 classes: Optional[List[str]] = None): # Pass this if pre-defined
 
-    Structure expected:
-    - images/experiment/plate/well_site_channel.png
-    - metadata.csv with columns: experiment, plate, well, site, cell_type, sirna_id, etc.
-    """
-
-    def __init__(self,
-                 root_dir: str = RXRX1_DATASET_ROOT,
-                 metadata_path: str = METADATA_CSV_PATH,
-                 transform_rgb: Optional[Callable] = None,
-                 split: str = "train",
-                 experiment: str = None,
-                 class_to_idx: Optional[Dict[str, int]] = None,
-                 classes: Optional[List[str]] = None):
-        """
-        Initialize RxRx1Dataset.
-
-        Args:
-            root_dir: Path to images directory
-            metadata_path: Path to metadata.csv
-            transform_rgb: Transform to apply to 6-channel images
-            split: Dataset split ("train", "test")
-            experiment: Experiment name (e.g., "HUVEC-01")
-            class_to_idx: Optional pre-computed class mapping
-            classes: Optional pre-computed class list
-        """
         self.root_dir = Path(root_dir)
-        self.metadata_path = Path(metadata_path)  # Ensure Path object
         self.transform_rgb = transform_rgb
-        self.split = split
-        self.experiment = experiment
+        self.transform_spectral = transform_spectral # Currently unused, assuming spectral processed to tensor then resized
+        self.stage_map = stage_map or DEFAULT_STAGE_MAP
+        self.apply_progression = apply_progression
+        self.progression_simulator = DiseaseProgressionSimulator() if apply_progression else None
+        self.use_spectral = use_spectral
 
-        # Load and filter metadata
-        self.metadata = self._load_metadata()
+        if not self.root_dir.exists():
+            logger.error(f"Dataset root directory not found: {self.root_dir}")
+            raise FileNotFoundError(f"Dataset root directory not found: {self.root_dir}")
 
-        if len(self.metadata) == 0:
-            logger.warning("No data found for the specified criteria")
-            # Initialize empty attributes to prevent AttributeError
-            self.classes = []
-            self.class_to_idx = {}
-            self.sirna_id_to_class_idx = {}
-            self.plates = []
-            self.plate_to_idx = {}
-            self.num_classes = 0
-            self.num_plates = 0
-            return
-
-        # Set up class mappings
-        if classes is not None and class_to_idx is not None:
+        if classes and class_to_idx:
             self.classes = classes
             self.class_to_idx = class_to_idx
         else:
-            self._setup_class_mappings()
+            self.classes = sorted([d.name for d in self.root_dir.iterdir() if d.is_dir()])
+            if not self.classes:
+                logger.warning(f"No class subdirectories found in {self.root_dir}. Dataset will be empty.")
+            self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
 
-        # Always create sirna_id_to_class_idx mapping
-        self._setup_sirna_mappings()
-
-        # Set up plate mappings
-        self._setup_plate_mappings()
-
-        # Final dataset info
+        self.idx_to_class = {idx: cls for cls, idx in self.class_to_idx.items()}
         self.num_classes = len(self.classes)
-        self.num_plates = len(self.plates)
 
-        logger.info(f"RxRx1Dataset initialized:")
-        logger.info(f"  Split: {self.split}, Experiment: {self.experiment}")
-        logger.info(f"  Samples: {len(self.metadata)}")
-        logger.info(f"  Genetic perturbations (classes): {self.num_classes}")
-        logger.info(f"  Experimental plates: {self.num_plates}")
+        self.images_metadata = self._load_images_metadata()
+        if not self.images_metadata:
+            logger.warning(f"No images loaded from {self.root_dir}. Check dataset structure and image formats.")
 
-    def _setup_sirna_mappings(self):
-        """Create mapping from sirna_id to class index."""
-        self.sirna_id_to_class_idx = {}
-
-        for idx, row in self.metadata.iterrows():
-            sirna_id = row['sirna_id']
-            class_name = f"siRNA_{sirna_id}"
-
-            if class_name in self.class_to_idx:
-                self.sirna_id_to_class_idx[sirna_id] = self.class_to_idx[class_name]
-            else:
-                # Fallback: assign to class 0 or create new class
-                logger.warning(f"siRNA_id {sirna_id} not found in classes, assigning to class 0")
-                self.sirna_id_to_class_idx[sirna_id] = 0
-
-    def _setup_class_mappings(self):
-        """Create class mappings from genetic perturbations."""
-        if 'sirna_id' in self.metadata.columns:
-            unique_sirnas = sorted(self.metadata['sirna_id'].unique())
-            logger.info(f"Using sirna_id as classes: {len(unique_sirnas)} genetic perturbations")
-
-            self.classes = [f"siRNA_{sid}" for sid in unique_sirnas]
-            self.class_to_idx = {class_name: idx for idx, class_name in enumerate(self.classes)}
-        else:
-            logger.warning("No sirna_id column found. Using dummy classes.")
-            self.classes = ["dummy_class"]
-            self.class_to_idx = {"dummy_class": 0}
-
-    def _setup_plate_mappings(self):
-        """Create plate mappings for batch identification."""
-        if 'plate' in self.metadata.columns:
-            unique_plates = sorted(self.metadata['plate'].unique())
-            self.plates = [f"plate_{plate}" for plate in unique_plates]
-            self.plate_to_idx = {plate_name: idx for idx, plate_name in enumerate(self.plates)}
-        else:
-            logger.warning("No plate column found. Using dummy plates.")
-            self.plates = ["dummy_plate"]
-            self.plate_to_idx = {"dummy_plate": 0}
-
-   # In the __getitem__ method, after loading the image but before transforms:
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get a single sample from the dataset."""
-        if idx >= len(self.metadata):
-            raise IndexError(f"Index {idx} out of range for dataset of size {len(self.metadata)}")
-
-        try:
-            row = self.metadata.iloc[idx]
-
-            # Load 6-channel image
-            rgb_image = self._load_image_channels(
-                plate=row['plate'],
-                well=row['well'],
-                site=row['site']
-            )
-
-            # Apply transforms (these should work with 6-channel now)
-            if self.transform_rgb:
-                rgb_image = self.transform_rgb(rgb_image)
-
-            # Manual normalization for 6 channels (simple approach)
-            # Normalize each channel to have mean=0, std=1
-            if rgb_image.dim() == 3:  # (C, H, W)
-                for c in range(rgb_image.shape[0]):
-                    channel = rgb_image[c]
-                    if channel.std() > 1e-6:  # Avoid division by zero
-                        rgb_image[c] = (channel - channel.mean()) / channel.std()
-
-            # Get labels
-            sirna_id = row['sirna_id']
-            plate_id = row['plate']
-
-            # Use the mapping we created in __init__
-            class_label = self.sirna_id_to_class_idx.get(sirna_id, 0)
-            plate_label = self.plate_to_idx.get(f"plate_{plate_id}", 0)
-
-            return {
-                'rgb_image': rgb_image,
-                'label': torch.tensor(class_label, dtype=torch.long),
-                'plate_id': torch.tensor(plate_label, dtype=torch.long),
-                'id': torch.tensor(idx, dtype=torch.long),
-                'metadata': {
-                    'experiment': row.get('experiment', 'unknown'),
-                    'plate': plate_id,
-                    'well': row['well'],
-                    'site': row['site'],
-                    'sirna_id': sirna_id,
-                    'cell_type': row.get('cell_type', 'unknown')
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"Error loading sample {idx}: {e}")
-            # Return a dummy sample to prevent crashes
-            dummy_image = torch.zeros((NUM_CHANNELS, IMAGE_SIZE_RGB[0], IMAGE_SIZE_RGB[1]))
-            return {
-                'rgb_image': dummy_image,
-                'label': torch.tensor(0, dtype=torch.long),
-                'plate_id': torch.tensor(0, dtype=torch.long),
-                'id': torch.tensor(idx, dtype=torch.long),
-                'metadata': {'error': str(e)}
-            }
-
-    def _load_metadata(self) -> pd.DataFrame:
-        """Load and filter metadata for the specified split and experiment."""
-        try:
-            if not self.metadata_path.exists():
-                logger.warning(f"Metadata file not found at {self.metadata_path}. Creating dummy data.")
-                return self._create_dummy_metadata()
-
-            df = pd.read_csv(self.metadata_path)
-            logger.info(f"Loaded metadata with {len(df)} total entries")
-
-            # Filter by experiment if specified and exists
-            if self.experiment and 'experiment' in df.columns:
-                exp_values = df['experiment'].unique()
-                if self.experiment in exp_values:
-                    df = df[df['experiment'] == self.experiment]
-                    logger.info(f"Filtered to {len(df)} entries for experiment '{self.experiment}'")
-                else:
-                    logger.warning(f"Experiment '{self.experiment}' not found. Using first available: {exp_values[0]}")
-                    self.experiment = exp_values[0]
-                    df = df[df['experiment'] == self.experiment]
-
-            # Filter by dataset split (train/test in RxRx1)
-            if 'dataset' in df.columns:
-                if self.split == "train":
-                    df = df[df['dataset'] == 'train']
-                elif self.split == "test":
-                    df = df[df['dataset'] == 'test']
-                logger.info(f"Filtered to {len(df)} entries for dataset split '{self.split}'")
-
-            # Filter to only plates that exist in your images folder
-            available_plates = self._get_available_plates()
-            if available_plates:
-                df = df[df['plate'].isin(available_plates)]
-                logger.info(f"Filtered to {len(df)} entries for available plates: {available_plates}")
-
-            # Development mode: limit data for faster testing
-            if DEV_MODE and len(df) > 1000:
-                logger.info(f"DEV_MODE: Limiting dataset to 1000 samples for faster testing")
-                df = df.sample(n=1000, random_state=42).reset_index(drop=True)
-
-            # Ensure required columns exist
-            required_cols = ['plate', 'well', 'site', 'sirna_id']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                logger.error(f"Missing required columns: {missing_cols}")
-                logger.info(f"Available columns: {list(df.columns)}")
-                return self._create_dummy_metadata()
-
-            return df.reset_index(drop=True)
-
-        except Exception as e:
-            logger.error(f"Error loading metadata: {e}")
-            return self._create_dummy_metadata()
-
-    def _get_available_plates(self) -> List[int]:
-        """Get list of plates that actually exist in the images folder."""
-        available_plates = []
-        try:
-            # Check what's directly in images folder (Plate3, Plate4)
-            if self.root_dir.exists():
-                for item in self.root_dir.iterdir():
-                    if item.is_dir() and item.name.startswith('Plate'):
-                        try:
-                            plate_num = int(item.name.replace('Plate', ''))
-                            available_plates.append(plate_num)
-                        except ValueError:
-                            continue
-
-            # Also check experiment subdirectories
-            if self.experiment:
-                exp_dir = self.root_dir / self.experiment
-                if exp_dir.exists():
-                    for item in exp_dir.iterdir():
-                        if item.is_dir() and item.name.startswith('Plate'):
-                            try:
-                                plate_num = int(item.name.replace('Plate', ''))
-                                available_plates.append(plate_num)
-                            except ValueError:
-                                continue
-
-            available_plates = sorted(list(set(available_plates)))
-            logger.info(f"Found plates in filesystem: {available_plates}")
-
-        except Exception as e:
-            logger.warning(f"Error scanning for available plates: {e}")
-
-        return available_plates
-
-    def _create_dummy_metadata(self) -> pd.DataFrame:
-        """Create dummy metadata for testing when real metadata is unavailable."""
-        logger.info("Creating dummy RxRx1 metadata for testing")
-
-        dummy_data = []
-        for plate in range(1, 6):  # 5 dummy plates
-            for well_row in ['A', 'B']:
-                for well_col in ['01', '02']:
-                    well = f"{well_row}{well_col}"
-                    for site in [1, 2]:
-                        # Create dummy genetic perturbation classes
-                        sirna_id = (plate + site) % 10  # Integer IDs as in real RxRx1
-                        cell_type = f"CellType_{plate % 3}"
-
-                        dummy_data.append({
-                            'experiment': self.experiment,
-                            'plate': plate,
-                            'well': well,
-                            'site': site,
-                            'cell_type': cell_type,
-                            'sirna_id': sirna_id,  # Integer, not string
-                            'dataset': self.split
-                        })
-
-        df = pd.DataFrame(dummy_data)
-        logger.info(f"Created dummy metadata with {len(df)} entries")
-        return df
-
-    def _load_image_channels(self, plate: int, well: str, site: int) -> torch.Tensor:
-        """Load all 6 fluorescence channels for a given image location."""
-        channels = []
-
-        for channel_idx, channel_name in enumerate(CHANNEL_NAMES):
-            # Updated paths based on your actual structure
-            possible_paths = [
-                # Structure 1: images/images/experiment/Plate*/well_ssite_channel.png
-                self.root_dir / self.experiment / f"Plate{plate}" / f"{well}_s{site}_{channel_name}.png",
-                # Structure 2: images/images/experiment/well_ssite_channel.png (flat structure)
-                self.root_dir / self.experiment / f"{well}_s{site}_{channel_name}.png",
-                # Structure 3: Different plate naming
-                self.root_dir / self.experiment / f"plate{plate}" / f"{well}_s{site}_{channel_name}.png",
-                # Structure 4: Different file extensions
-                self.root_dir / self.experiment / f"Plate{plate}" / f"{well}_s{site}_{channel_name}.tiff",
-                self.root_dir / self.experiment / f"Plate{plate}" / f"{well}_s{site}_{channel_name}.jpg",
-                # Structure 5: Different site naming
-                self.root_dir / self.experiment / f"Plate{plate}" / f"{well}_site{site}_{channel_name}.png",
-            ]
-
-            img_array = None
-            found_path = None
-
-            for img_path in possible_paths:
-                try:
-                    if img_path.exists():
-                        # Load as grayscale (single channel)
-                        img = Image.open(img_path).convert('L')
-                        img_array = np.array(img, dtype=np.float32) / 255.0
-                        found_path = img_path
-                        break
-                except Exception as e:
-                    logger.debug(f"Failed to load {img_path}: {e}")
+    def _load_images_metadata(self) -> list:
+        images_meta = []
+        for cls_name in self.classes:
+            cls_dir = self.root_dir / cls_name
+            if not cls_dir.is_dir():
+                continue
+            label = self.class_to_idx[cls_name]
+            for img_file in cls_dir.iterdir():
+                if img_file.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
                     continue
+                
+                img_path_str = str(img_file)
+                spectral_path_str = str(img_file.with_name(f"{img_file.stem}_spectral.npy"))
+                has_spectral = Path(spectral_path_str).exists()
+                
+                images_meta.append({
+                    "rgb_path": img_path_str,
+                    "spectral_path": spectral_path_str if has_spectral else None,
+                    "label": label,
+                    "class_name": cls_name
+                })
+        logger.info(f"Found {len(images_meta)} potential image entries from {self.root_dir} across {len(self.classes)} classes.")
+        return images_meta
 
-            if img_array is None:
-                # Log the first few attempted paths for debugging
-                logger.warning(f"No image found for Plate{plate}/{well}_s{site}_{channel_name}")
-                logger.debug(f"Tried paths: {[str(p) for p in possible_paths[:3]]}")
-                # Create dummy channel data
-                img_array = np.random.rand(ORIGINAL_IMAGE_SIZE[0], ORIGINAL_IMAGE_SIZE[1]).astype(np.float32)
-            else:
-                # Log successful path (only for first channel to avoid spam)
-                if channel_idx == 0:
-                    pass
-                    # logger.info(f"✅ Successfully found images at: {found_path.parent}")
-
-            channels.append(img_array)
-
-        # Stack channels to create 6-channel image: (C, H, W)
-        image_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32)
-        return image_tensor
+    def _simulate_ndvi(self, rgb_pil_img: Image.Image) -> torch.Tensor:
+        try:
+            rgb_array = np.array(rgb_pil_img.convert('RGB')) / 255.0
+            nir_proxy = 0.2 * rgb_array[:, :, 0] + 0.5 * rgb_array[:, :, 1] + 0.3 * rgb_array[:, :, 2]
+            red_band = rgb_array[:, :, 0]
+            
+            numerator = nir_proxy - red_band
+            denominator = nir_proxy + red_band + 1e-8 
+            ndvi = numerator / denominator
+            ndvi = np.clip(ndvi, -1.0, 1.0)
+            ndvi_tensor = torch.tensor(ndvi, dtype=torch.float32).unsqueeze(0) # [1, H, W]
+            
+            resize_transform = T_old.Resize(IMAGE_SIZE_SPECTRAL, interpolation=T_old.InterpolationMode.BILINEAR, antialias=True)
+            resized_ndvi = resize_transform(ndvi_tensor)
+            return resized_ndvi
+        except Exception as e:
+            logger.error(f"Error simulating NDVI: {e}. Returning zero tensor.", exc_info=True)
+            return torch.zeros((1, IMAGE_SIZE_SPECTRAL[0], IMAGE_SIZE_SPECTRAL[1]), dtype=torch.float32)
 
     def __len__(self) -> int:
-        return len(self.metadata)
+        return len(self.images_metadata)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        item_meta = self.images_metadata[idx]
+        img_path_str = item_meta["rgb_path"]
+        spectral_path_str = item_meta["spectral_path"]
+        label = item_meta["label"]
+        
+        output_dict: Dict[str, Any] = {
+            "rgb_image": None, "spectral_image": None, "label": label, "stage": "unknown", "id": idx
+        }
+
+        try:
+            rgb_pil_img = Image.open(img_path_str).convert('RGB')
+        except (UnidentifiedImageError, FileNotFoundError, IOError) as e:
+            logger.error(f"Critical error opening RGB image {img_path_str} at index {idx}: {e}. Placeholder will be used by collate_fn if needed.")
+            output_dict["label"] = -1 # Indicate error
+            output_dict["stage"] = "error_loading_rgb"
+            # Return default sized tensors for RGB, spectral will be None
+            output_dict["rgb_image"] = torch.zeros((3, IMAGE_SIZE_RGB[0], IMAGE_SIZE_RGB[1]), dtype=torch.float32)
+            return output_dict # Spectral remains None
+
+        # Determine stage for progression simulation
+        # The `stage_map` uses class index. If you want to map by class name, adjust `stage_map` or logic.
+        stage_for_sim = self.stage_map.get(label, 'unknown')
+        output_dict["stage"] = stage_for_sim
+
+        if self.apply_progression and self.progression_simulator:
+            rgb_pil_img_prog = self.progression_simulator.apply(rgb_pil_img.copy(), stage_for_sim)
+        else:
+            rgb_pil_img_prog = rgb_pil_img
+
+        # Process RGB
+        if self.transform_rgb:
+            rgb_tensor = self.transform_rgb(rgb_pil_img_prog)
+        else: # Default minimal transform
+            rgb_tensor = T_v2.Compose([
+                T_v2.ToImage(),
+                T_v2.ToDtype(torch.float32, scale=True) # Scales to [0,1]
+            ])(rgb_pil_img_prog)
+        output_dict["rgb_image"] = rgb_tensor
+
+        # Process Spectral
+        spectral_tensor: Optional[torch.Tensor] = None
+        if self.use_spectral:
+            if spectral_path_str:
+                try:
+                    spectral_data = np.load(spectral_path_str) # Expects [C, H, W] or [H, W]
+                    if spectral_data.ndim == 2: # H, W
+                        spectral_data = spectral_data[np.newaxis, ...] # 1, H, W
+                    elif spectral_data.ndim == 3 and spectral_data.shape[0] != 1 and spectral_data.shape[-1] == 1: # H, W, 1
+                         spectral_data = np.transpose(spectral_data, (2,0,1)) # 1, H, W
+                    
+                    spectral_tensor_raw = torch.tensor(spectral_data, dtype=torch.float32)
+                    # Ensure C, H, W format before resize
+                    if spectral_tensor_raw.ndim == 2: spectral_tensor_raw = spectral_tensor_raw.unsqueeze(0)
+
+                    resize_spectral = T_old.Resize(IMAGE_SIZE_SPECTRAL, interpolation=T_old.InterpolationMode.BILINEAR, antialias=True)
+                    spectral_tensor = resize_spectral(spectral_tensor_raw)
+
+                except Exception as e:
+                    logger.warning(f"Could not load/process spectral data {spectral_path_str}: {e}. Simulating NDVI.")
+                    spectral_tensor = self._simulate_ndvi(rgb_pil_img.copy()) # Use original RGB for NDVI
+            else:
+                logger.debug(f"No spectral path for {img_path_str}, simulating NDVI.")
+                spectral_tensor = self._simulate_ndvi(rgb_pil_img.copy()) # Use original RGB for NDVI
+        
+        if spectral_tensor is not None:
+            # Ensure correct channel dim and size for spectral tensor
+            if spectral_tensor.ndim == 2: spectral_tensor = spectral_tensor.unsqueeze(0)
+            if spectral_tensor.shape[0] == 0 : # If somehow it became 0 channels
+                logger.warning(f"Spectral tensor has 0 channels for {img_path_str}. Simulating NDVI.")
+                spectral_tensor = self._simulate_ndvi(rgb_pil_img.copy())
+            elif spectral_tensor.shape[1:] != IMAGE_SIZE_SPECTRAL:
+                 logger.warning(f"Resizing spectral tensor {spectral_tensor.shape} to target spectral size post-hoc for {img_path_str}.")
+                 resize_spectral = T_old.Resize(IMAGE_SIZE_SPECTRAL, interpolation=T_old.InterpolationMode.BILINEAR, antialias=True)
+                 spectral_tensor = resize_spectral(spectral_tensor)
+            output_dict["spectral_image"] = spectral_tensor
+            
+        return output_dict

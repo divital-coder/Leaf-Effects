@@ -1,4 +1,4 @@
-# config.py - RxRx1 Bio-Image Analysis with Batch Effect Correction
+# config.py
 import logging
 import torch
 import numpy as np
@@ -13,122 +13,65 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+# For full reproducibility, uncommenting these might be necessary,
+# but they can impact performance.
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
 
 # --- Core Paths ---
-# Updated to your actual RxRx1 dataset location
-DATASET_BASE_PATH = "/teamspace/studios/this_studio/Comprehensive-RxR1 cellular imaging dataset"
+# IMPORTANT: Update this path to your actual dataset location
+DATASET_BASE_PATH = "/teamspace/studios/this_studio/cvpr25/SAR-CLD-2024 A Comprehensive Dataset for Cotton Leaf Disease Detection"
 
-# RxRx1 specific paths - images and metadata are directly in the base path
-RXRX1_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "images")
-METADATA_CSV_PATH = os.path.join(DATASET_BASE_PATH, "metadata.csv")
-
-# For development with subset
-DEV_MODE = True  # Set to False for full dataset
-if DEV_MODE:
-    # For development, still use the same images path but limit data in other ways
-    # We'll handle subset logic in the dataset class rather than changing paths
-    NUM_EPOCHS = 5  # Fewer epochs for testing
-    BATCH_SIZE = 16  # Smaller batches for development
-else:
-    NUM_EPOCHS = 50  # Full training epochs
-    BATCH_SIZE = 32  # Full batch size
+ORIGINAL_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "Original Dataset")
+AUGMENTED_DATASET_ROOT = os.path.join(DATASET_BASE_PATH, "Augmented Dataset") # If you use it
 
 # Output directories
 MODEL_SAVE_PATH = "saved_models"
 VISUALIZATION_DIR = "visualizations"
-RESULTS_DIR = "results"
-LOGS_DIR = "logs"
 
 # Ensure output directories exist
-for dir_path in [MODEL_SAVE_PATH, VISUALIZATION_DIR, RESULTS_DIR, LOGS_DIR]:
-    os.makedirs(dir_path, exist_ok=True)
+os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
-# --- RxRx1 Dataset Constants ---
-# RxRx1 has 6 fluorescence channels (w1-w6, not named channels)
-NUM_CHANNELS = 6
-CHANNEL_NAMES = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6']  # Actual RxRx1 channel naming
+# --- Dataset Constants ---
+DEFAULT_STAGE_MAP = {
+    # Example: map class index to stage name
+    # This needs to be aligned with how your classes are defined.
+    # If classes are 'diseaseA', 'diseaseB', 'healthy', then map those indices.
+    # e.g., if class 'Alternaria Leaf Spot' (index 0) has stages:
+    # 0: 'early', # for Alternaria Leaf Spot
+    # If another disease (index 1) also has stages:
+    # 1: 'mid', # for Bacterial Blight, etc.
+    # This map is primarily for the progression simulator if `apply_progression=True`
+    # and the dataset label is used to infer a default stage for simulation.
+    0: 'early', 1: 'mid', 2: 'advanced',
+    3: 'early', 4: 'mid', 5: 'advanced',
+    6: 'unknown' # for healthy or classes without distinct progression stages in simulation
+}
+# Number of classes will be determined dynamically from the dataset in data_utils.py
 
-# Image properties (RxRx1 original: 512x512, we'll resize to 224x224)
-ORIGINAL_IMAGE_SIZE = (512, 512)
-IMAGE_SIZE_RGB = (224, 224)  # Standard input size for models
-IMAGE_SIZE_SPECTRAL = (224, 224)  # Same as RGB for this project
-
-# RxRx1 dataset statistics (updated from metadata schema)
-NUM_GENETIC_PERTURBATIONS = 1138  # siRNA classes (corrected from 1108)
-NUM_EXPERIMENTAL_PLATES = 51      # Batch sources (varies by experiment)
-TOTAL_IMAGES_APPROX = 125510
-
-# Normalization parameters (will be computed from training data)
-# Placeholder values - should be updated after computing real statistics
-CHANNEL_MEANS = [0.485, 0.456, 0.406, 0.485, 0.456, 0.406]
-CHANNEL_STDS = [0.229, 0.224, 0.225, 0.229, 0.224, 0.225]
-
+# Image sizes
+IMAGE_SIZE_RGB = (224, 224)  # Input size for RGB models
+IMAGE_SIZE_SPECTRAL = (224, 224) # Target size for spectral data
 
 # --- Training Hyperparameters ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# GPU-optimized settings
-if torch.cuda.is_available():
-    BATCH_SIZE = 32          # Can handle larger batches
-    NUM_WORKERS = 4          # Re-enable multiprocessing
-    PIN_MEMORY = True        # Faster CPU->GPU transfer
-    NUM_EPOCHS = 50          # Full training
-else:
-    BATCH_SIZE = 16          # Smaller for CPU
-    NUM_WORKERS = 0          # Avoid multiprocessing issues
-    PIN_MEMORY = False       # Not useful for CPU
-    NUM_EPOCHS = 5           # Quick testing
-# Model configurations
-MODEL_NAME = "resnet50"  # Feature extractor backbone
+MODEL_NAME = "resnet50"  # Options: "resnet50", "vit_base_patch16_224", etc. (see models.py)
 PRETRAINED = True
 
-# Training parameters
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 50  # Increased for adversarial training
-NUM_WORKERS = 4
+NUM_EPOCHS = 10 # Start with a small number for testing, increase for real training
+NUM_WORKERS = 2 # Adjust based on your system
 WEIGHT_DECAY = 1e-4
 
-# Adversarial training specific parameters
-LAMBDA_ADVERSARIAL = 1.0      # Weight for adversarial loss
-GRADIENT_REVERSAL_ALPHA = 1.0 # Gradient reversal strength
-MODEL_TYPE = "dann"           # "dann" for adversarial, "baseline" for standard
+# Data Splitting
+VALIDATION_SPLIT_RATIO = 0.2 # 20% of data for validation
+TEST_SPLIT_RATIO = 0.0 # Set to > 0 if you want a separate test set from the start
 
-# Data Splitting (stratified by both genetic perturbation and plate)
-VALIDATION_SPLIT_RATIO = 0.15  # 15% for validation
-TEST_SPLIT_RATIO = 0.15        # 15% for test
+# Augmentation & Dataset options for training
+APPLY_PROGRESSION_TRAIN = False # Whether to apply disease progression simulation during training
+USE_SPECTRAL_TRAIN = False      # Whether to load/use spectral data during training (for baselines, typically False)
 
-# Stratification options for batch-aware splitting
-STRATIFY_BY_PLATE = True           # Ensure plates are distributed across splits
-STRATIFY_BY_PERTURBATION = True    # Ensure genetic perturbations are distributed
-
-# Augmentation & Dataset options
-USE_AUGMENTATION = True
-AUGMENTATION_STRENGTH = 0.5        # Controls intensity of augmentations
-APPLY_PROGRESSION_TRAIN = False    # Not applicable for RxRx1
-USE_SPECTRAL_TRAIN = False         # We use all 6 channels as "multi-spectral"
-
-# --- Evaluation Metrics ---
-METRICS_AVERAGE = 'macro'  # 'macro', 'micro', or 'weighted'
-
-# Batch effect evaluation parameters
-TSNE_PERPLEXITY = 30
-TSNE_N_ITER = 1000
-UMAP_N_NEIGHBORS = 15
-UMAP_MIN_DIST = 0.1
-
-# Batch effect removal metrics thresholds
-BATCH_PREDICTION_RANDOM_THRESHOLD = 0.1  # Batch prediction should approach 1/51 ≈ 0.02
-MAX_ACCEPTABLE_CV = 0.3                   # Coefficient of Variation across batches
-
-# --- Experiment Tracking ---
-EXPERIMENT_NAME = "rxrx1_batch_effects_phase1"
-USE_WANDB = False  # Set to True if using Weights & Biases
-WANDB_PROJECT = "rxrx1-batch-effects"
-
-# --- Dataset Stage Map (not used for RxRx1, kept for compatibility) ---
-DEFAULT_STAGE_MAP = {
-    # Not applicable for RxRx1 - genetic perturbations don't have "progression stages"
-    # Kept for compatibility with existing code structure
-    i: 'perturbation' for i in range(NUM_GENETIC_PERTURBATIONS)
-}
+# --- Evaluation ---
+METRICS_AVERAGE = 'macro' # 'macro', 'micro', or 'weighted' for precision, recall, f1
