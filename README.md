@@ -45,9 +45,9 @@ From the root of the repository, run:
 
 git clone https://github.com/divital-coder/Leaf-Effects.git
 cd Leaf-Effects
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+uv venv .venv 
+source .venv/bin/activate
+uv pip install -r requirements.txt
 
 ```
 
@@ -64,17 +64,17 @@ You can run individual experiments using the scripts provided in each phase dire
 
 **Pre-training:**
 ```bash
-cd phase3_pretraining && python run_ssl_pretraining.py
+cd phase3_pretraining && uv run python run_ssl_pretraining.py
 ```
 
 **Fine-tuning:**
 ```bash
-cd phase4_finetuning && python main.py --config config.yaml
+cd phase4_finetuning && uv run python main.py --config config.yaml
 ```
 
 **Analysis:**
 ```bash
-cd phase5_analysis_and_ablation && python analyze_best_model.py
+cd phase5_analysis_and_ablation && uv run python analyze_best_model.py
 ```
 
 ### Model Comparison & Analysis
@@ -83,12 +83,12 @@ Use the analysis scripts to evaluate model performance and visualize features.
 
 **Feature Analysis:**
 ```bash
-python phase5_analysis_and_ablation/visualize_features.py
+uv run python phase5_analysis_and_ablation/visualize_features.py
 ```
 
 **Attention Analysis:**
 ```bash
-python phase5_analysis_and_ablation/visualize_attention.py
+uv run python phase5_analysis_and_ablation/visualize_attention.py
 ```
 
 ## Results
