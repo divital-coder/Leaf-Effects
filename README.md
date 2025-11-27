@@ -42,9 +42,13 @@ Includes optimized attention mechanisms and memory-efficient implementation.
 From the root of the repository, run:
 
 ```bash
-make install  # To install the package and dependencies
-# Or manually:
+
+git clone https://github.com/divital-coder/Leaf-Effects.git
+cd Leaf-Effects
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+
 ```
 
 ## Usage
@@ -90,24 +94,34 @@ python phase5_analysis_and_ablation/visualize_attention.py
 ## Results
 
 ### Feature Analysis
-![Feature Space Comparison](assets/tsne_feature_space_comparison.png)
-*t-SNE visualization showing clear separation of semantic features.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark-5.svg">
+  <img alt="Feature Analysis" src="assets/frame-5.svg">
+</picture>
 
 ### Training Convergence
-![Convergence Analysis](assets/convergence_plot.png)
-*Training progression compared to baseline models.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark-6.svg">
+  <img alt="Training Convergence" src="assets/frame-6.svg">
+</picture>
 
 ### Transfer Learning Performance
-![Confusion Matrix](assets/confusion_matrix.png)
-*Performance on downstream classification tasks.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark-7.svg">
+  <img alt="Transfer Learning Performance" src="assets/frame-7.svg">
+</picture>
 
 ### Ablation Studies
-![Ablation Results](assets/convergence_plot_detailed_ablations.png)
-*Impact of different architectural choices.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark-8.svg">
+  <img alt="Ablation Studies" src="assets/frame-8.svg">
+</picture>
 
 ### Attention Analysis
-![Attention Patterns](assets/attention_rollout_visualization.png)
-*Visualization of attention patterns across different layers.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark-9.svg">
+  <img alt="Attention Analysis" src="assets/frame-9.svg">
+</picture>
 
 ## Development
 

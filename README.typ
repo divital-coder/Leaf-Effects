@@ -15,13 +15,15 @@
   feature: ("Feature",),
   example: ("Example", gray),
   syntax: ("Syntax",),
-  variant: ("Variant",),
+  variant: ("Variant", orange),
 )
 
 #show: frame-style(styles.boxy)
 
 // Frame 1: Patch Embedding
-#feature[Patch Embedding][Initial tokenization of input images][
+#variant[Patch Embedding][Initial tokenization][
+The `PatchEmbed` class is responsible for breaking down the input image into fixed-size patches. This is the first step in the Vision Transformer pipeline, converting raw pixels into a sequence of embeddings.
+
 ```python
 class PatchEmbed(nn.Module):
     def __init__(self, img_size: Tuple[int, int] = (224, 224), patch_size: int = 16,
@@ -38,12 +40,15 @@ class PatchEmbed(nn.Module):
         x = x.transpose(1, 2) # B, N_patches_flat, C_embed
         return self.norm(x)
 ```
+It uses a 2D convolution with kernel size and stride equal to the patch size to achieve this efficiently.
 ]
 
 #pagebreak()
 
 // Frame 2: Hierarchical Stages
-#feature[Hierarchical Stages][Stacked transformer blocks with progressive downsampling][
+#variant[Hierarchical Stages][Progressive processing][
+The `HVTStage` manages a sequence of Transformer blocks. It supports progressive downsampling, allowing the model to build a hierarchical representation of features, similar to a CNN.
+
 ```python
 class HVTStage(nn.Module):
     def __init__(self, dim: int, current_input_resolution_patches: Tuple[int, int], depth: int, ...):
@@ -62,12 +67,15 @@ class HVTStage(nn.Module):
             x = self.downsample_layer(x)
         return x
 ```
+Each stage consists of multiple transformer blocks followed by an optional downsampling layer.
 ]
 
 #pagebreak()
 
 // Frame 3: Feature Pyramid
-#feature[Feature Pyramid][Multi-scale output representations for downstream tasks][
+#variant[Feature Pyramid][Multi-scale output][
+The `forward_features_encoded` method extracts features from both the RGB and optional spectral streams. It returns the encoded features along with the original patch grid dimensions, facilitating multi-scale analysis.
+
 ```python
 def forward_features_encoded(self, rgb_img: torch.Tensor, spectral_img: Optional[torch.Tensor] = None):
     # ... (setup)
@@ -78,12 +86,15 @@ def forward_features_encoded(self, rgb_img: torch.Tensor, spectral_img: Optional
     # ... (spectral stream handling)
     return x_rgb_encoded, x_spectral_encoded, rgb_orig_patch_grid, spectral_orig_patch_grid
 ```
+This dual-stream approach allows the model to leverage both visual and spectral information.
 ]
 
 #pagebreak()
 
 // Frame 4: Efficiency Optimizations
-#feature[Efficiency Optimizations][Includes optimized attention mechanisms and memory-efficient implementation][
+#variant[Efficiency Optimizations][Patch Merging][
+`PatchMerging` reduces the spatial resolution of the feature map by a factor of 2 while increasing the channel dimension. This is crucial for creating the hierarchical structure and maintaining computational efficiency.
+
 ```python
 class PatchMerging(nn.Module):
     def __init__(self, input_resolution_patches: Tuple[int, int], dim: int, norm_layer=nn.LayerNorm):
@@ -99,4 +110,45 @@ class PatchMerging(nn.Module):
         x = self.norm(x)
         return self.reduction(x)
 ```
+It concatenates features from 2x2 neighboring patches and projects them to a new dimension.
+]
+
+#pagebreak()
+
+// Frame 5: Feature Analysis Result
+#variant[Feature Analysis][t-SNE Visualization][
+#image("assets/tsne_feature_space_comparison.png", width: 100%)
+The t-SNE plot demonstrates the clear separation of semantic classes in the feature space, indicating that the model has learned discriminative representations.
+]
+
+#pagebreak()
+
+// Frame 6: Training Convergence Result
+#variant[Training Convergence][Loss & Accuracy][
+#image("assets/convergence_plot.png", width: 100%)
+The convergence plots show the training and validation loss/accuracy over epochs. The model demonstrates stable training and good generalization.
+]
+
+#pagebreak()
+
+// Frame 7: Transfer Learning Result
+#variant[Transfer Learning][Confusion Matrix][
+#image("assets/confusion_matrix.png", width: 100%)
+The confusion matrix highlights the model's performance on downstream classification tasks, showing high accuracy across most classes.
+]
+
+#pagebreak()
+
+// Frame 8: Ablation Studies Result
+#variant[Ablation Studies][Architectural Impact][
+#image("assets/convergence_plot_detailed_ablations.png", width: 100%)
+This plot compares the performance of different architectural configurations, justifying the design choices made in the final model.
+]
+
+#pagebreak()
+
+// Frame 9: Attention Analysis Result
+#variant[Attention Analysis][Rollout Visualization][
+#image("assets/attention_rollout_visualization.png", width: 100%)
+Attention rollout visualizations reveal which parts of the image the model focuses on, providing interpretability for its predictions.
 ]
