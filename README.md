@@ -123,15 +123,10 @@ python phase5_analysis_and_ablation/visualize_attention.py
   <img alt="Attention Analysis" src="assets/frame-9.svg">
 </picture>
 
-## Development
 
-Suggested extensions and settings for VSCode/Cursor are provided in `.vscode/` (if available).
+**Note: Want to create a similar README.md? Follow the instructions in the [Typst Configuration Readme Rendering Commands](#typst-configuration-readme-rendering-commands) section.**
 
-### Contributing
-
-Please read our [CONTRIBUTING.md](CONTRIBUTING.md) file for guidelines on how to contribute to this project.
-
-### Development Commands
+### Typst Configuration Readme Rendering Commands
 
 There are various `make` commands that may be helpful.
 
@@ -140,4 +135,5 @@ make format  # Run black and isort
 make lint    # Run flake8, mypy, black --check, and isort --check
 make test    # Run tests
 make clean   # Clean up cache files
+make readme
 ```
